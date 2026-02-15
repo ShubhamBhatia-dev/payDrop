@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
+import Swal from 'sweetalert2';
 import { useAuth } from '../context/AuthContext';
 import { streamAPI } from '../api/api';
 import { withdraw } from '../utils/web3Service';
@@ -8,18 +9,19 @@ import Card, { CardHeader, CardBody } from '../components/Card';
 import {
     Wallet, LogOut, DollarSign, TrendingUp, Download, Clock,
     Activity, Eye, EyeOff, Copy, Check, ArrowDownToLine, Receipt,
-    ArrowLeftRight
+    ArrowLeftRight, FileDown
 } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import './EmployeeDashboard.css';
 
 // Precision scaling (1e18)
-const PRECISION = BigInt(1e18);
+const PRECISION = 10n ** 18n;
 
 // Formatting helper
 const formatWei = (weiBigInt) => {
-    if (!weiBigInt) return "0.000000";
-    return (Number(weiBigInt) / 1e18).toFixed(6);
+    if (!weiBigInt || weiBigInt === 0n) return "0.00000000";
+    const value = Number(weiBigInt) / 1e18;
+    return value.toFixed(8);
 };
 
 const EmployeeDashboard = () => {
@@ -35,19 +37,32 @@ const EmployeeDashboard = () => {
     const [loading, setLoading] = useState(true);
     const [liveClaimable, setLiveClaimable] = useState({}); // streamId -> amount (BigInt)
 
-    useEffect(() => {
-        const fetchUserStreams = async () => {
-            if (!walletAddress) return;
-            try {
-                const data = await streamAPI.getUserStreams(walletAddress);
-                setStreams(data);
-            } catch (error) {
-                console.error("Failed to fetch user streams", error);
-            } finally {
-                setLoading(false);
-            }
-        };
+    const [transactions, setTransactions] = useState([]);
+    const [isWithdrawingAll, setIsWithdrawingAll] = useState(false);
+    const [withdrawingStreamId, setWithdrawingStreamId] = useState(null);
 
+    // Filter states
+    const [filterMonth, setFilterMonth] = useState('all');
+    const [filterYear, setFilterYear] = useState(new Date().getFullYear().toString());
+    const [filterType, setFilterType] = useState('all');
+
+    const fetchUserStreams = async () => {
+        if (!walletAddress) return;
+        try {
+            const [streamsData, txData] = await Promise.all([
+                streamAPI.getUserStreams(walletAddress),
+                streamAPI.getUserTransactions(walletAddress)
+            ]);
+            setStreams(streamsData);
+            setTransactions(txData);
+        } catch (error) {
+            console.error("Failed to fetch user streams", error);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    useEffect(() => {
         fetchUserStreams();
     }, [walletAddress]);
 
@@ -56,48 +71,74 @@ const EmployeeDashboard = () => {
         if (streams.length === 0) return;
 
         const timer = setInterval(() => {
-            const newClaimable = {};
-            streams.forEach(stream => {
-                if (stream.state !== 'Active' && stream.state !== 'Paused') {
-                    newClaimable[stream.streamId] = 0n;
-                    return;
-                }
-
+            try {
+                const newClaimable = {};
                 const now = BigInt(Math.floor(Date.now() / 1000));
-                const startTime = BigInt(stream.startTime);
-                const endTime = BigInt(stream.endTime);
-                const ratePerSecond = BigInt(stream.ratePerSecond);
-                const deposit = BigInt(stream.deposit);
-                const withdrawn = BigInt(stream.withdrawn);
-                const totalPaused = BigInt(stream.totalPausedDuration || 0);
+                const SECONDS_IN_PRECISION = 10n ** 18n;
 
-                let effectiveTime = now;
-                if (stream.state === 'Paused') {
-                    // If backend updated state to Paused, we should have pausedTime or assume current behavior
-                    // For simplified meta-mask first, we assume endTime was shifted or we calculate up to now
-                    // The contract calculates precisely. Here we approximate for UI.
-                    effectiveTime = now; // simplified
-                }
+                streams.forEach(stream => {
+                    if (!stream.startTime || !stream.ratePerSecond) {
+                        newClaimable[stream.streamId] = 0n;
+                        return;
+                    }
 
-                if (effectiveTime < startTime) {
-                    newClaimable[stream.streamId] = 0n;
-                    return;
-                }
+                    try {
+                        const startTime = BigInt(stream.startTime);
+                        const endTime = BigInt(stream.endTime || startTime);
+                        const ratePerSecond = BigInt(stream.ratePerSecond);
+                        const deposit = BigInt(stream.deposit || 0);
+                        const withdrawn = BigInt(stream.withdrawn || 0);
+                        const totalPaused = BigInt(stream.totalPausedDuration || 0);
 
-                const elapsed = effectiveTime - startTime - totalPaused;
-                const adjustedEnd = endTime + totalPaused;
-                const actualEffective = effectiveTime > adjustedEnd ? adjustedEnd : effectiveTime;
-                const actualElapsed = actualEffective - startTime - totalPaused;
+                        // Vesting logic: Calculate effective time based on state
+                        let effectiveTime = now;
 
-                const vestedScaled = actualElapsed * ratePerSecond;
-                const totalVested = vestedScaled / PRECISION;
+                        if (stream.state === 'Paused' || stream.state === 'Active') {
+                            // While active or paused, we calculate up to now
+                            // The contract handles the precise pause duration subtraction
+                            effectiveTime = now;
+                        } else {
+                            // For Completed/Cancelled, we stop at endTime
+                            effectiveTime = endTime;
+                        }
 
-                const cappedVested = totalVested > deposit ? deposit : totalVested;
-                const claimable = cappedVested > withdrawn ? cappedVested - withdrawn : 0n;
+                        const adjustedEnd = endTime + totalPaused;
+                        const actualEffective = effectiveTime > adjustedEnd ? adjustedEnd : effectiveTime;
 
-                newClaimable[stream.streamId] = claimable;
-            });
-            setLiveClaimable(newClaimable);
+                        const actualElapsed = actualEffective - startTime - totalPaused;
+
+                        if (actualElapsed <= 0n) {
+                            newClaimable[stream.streamId] = 0n;
+                        } else {
+                            let totalVested;
+
+                            if (stream.streamType === 'OneTime') {
+                                // Cliff logic: 0 until the very end, then 100%
+                                // We check if current time reached the adjusted end time
+                                if (actualEffective >= adjustedEnd) {
+                                    totalVested = deposit;
+                                } else {
+                                    totalVested = 0n;
+                                }
+                            } else {
+                                // Continuous logic: linear streaming
+                                // Note: ratePerSecond from DB is already scaled to Wei per second
+                                totalVested = actualElapsed * ratePerSecond;
+                            }
+
+                            const cappedVested = totalVested > deposit ? deposit : totalVested;
+                            const claimable = cappedVested > withdrawn ? cappedVested - withdrawn : 0n;
+                            newClaimable[stream.streamId] = claimable;
+                        }
+                    } catch (e) {
+                        console.error(`Error calculating for stream ${stream.streamId}:`, e);
+                        newClaimable[stream.streamId] = 0n;
+                    }
+                });
+                setLiveClaimable(newClaimable);
+            } catch (globalErr) {
+                console.error("Live counter calculation error:", globalErr);
+            }
         }, 1000);
 
         return () => clearInterval(timer);
@@ -110,20 +151,65 @@ const EmployeeDashboard = () => {
     }, [user, navigate]);
 
     // Mock data for visualizations - restore these
-    const earningsHistory = [
-        { date: 'Week 1', amount: 0.05 },
-        { date: 'Week 2', amount: 0.12 },
-        { date: 'Week 3', amount: 0.08 },
-        { date: 'Week 4', amount: 0.15 },
-        { date: 'Week 5', amount: 0.10 },
-        { date: 'Week 6', amount: 0.18 },
-        { date: 'Week 7', amount: 0.25 },
-    ];
+    const earningsHistory = useMemo(() => {
+        if (!transactions.length) return [
+            { date: 'Initial', amount: 0 }
+        ];
 
-    const recentTransactions = streams.flatMap(s => [
-        { id: `tx-${s.streamId}-1`, type: 'Stream Created', amount: formatWei(BigInt(s.deposit)), date: new Date(s.startTime * 1000).toISOString(), status: 'completed' },
-        ...(Number(s.withdrawn) > 0 ? [{ id: `tx-${s.streamId}-2`, type: 'Withdrawal', amount: formatWei(BigInt(s.withdrawn)), date: new Date().toISOString(), status: 'completed' }] : [])
-    ]);
+        // Group withdrawals by date
+        const withdrawalMap = {};
+        transactions
+            .filter(tx => tx.type === 'Withdrawal')
+            .forEach(tx => {
+                const date = new Date(tx.timestamp || tx.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+                const amt = Number(BigInt(tx.amount || 0)) / 1e18;
+                withdrawalMap[date] = (withdrawalMap[date] || 0) + amt;
+            });
+
+        const sortedEntries = Object.entries(withdrawalMap)
+            .sort((a, b) => new Date(a[0]) - new Date(b[0]))
+            .map(([date, amount]) => ({ date, amount }));
+
+        return sortedEntries.length > 0 ? sortedEntries : [
+            { date: 'Initial', amount: 0 }
+        ];
+    }, [transactions]);
+
+    const filteredTransactions = useMemo(() => {
+        return transactions.filter(tx => {
+            const date = new Date(tx.timestamp || tx.date);
+            const matchesMonth = filterMonth === 'all' || (date.getMonth() + 1).toString() === filterMonth;
+            const matchesYear = filterYear === 'all' || date.getFullYear().toString() === filterYear;
+            const matchesType = filterType === 'all' || tx.type === filterType;
+            return matchesMonth && matchesYear && matchesType;
+        }).sort((a, b) => new Date(b.timestamp || b.date) - new Date(a.timestamp || a.date));
+    }, [transactions, filterMonth, filterYear, filterType]);
+
+    const handleExportTransactions = () => {
+        if (filteredTransactions.length === 0) {
+            Swal.fire({ icon: 'info', title: 'No Data', text: 'No transactions found for the current filters', background: '#1a1a1a', color: '#fff' });
+            return;
+        }
+
+        const headers = ["Date", "Type", "Amount (HLUSD)", "Status"];
+        const csvRows = filteredTransactions.map(tx => [
+            new Date(tx.timestamp || tx.date).toLocaleString(),
+            tx.type,
+            tx.amount ? formatWei(BigInt(tx.amount)) : '0',
+            tx.status || 'Completed'
+        ]);
+
+        const csvContent = [headers, ...csvRows].map(row => row.join(',')).join('\n');
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement("a");
+        const url = URL.createObjectURL(blob);
+        link.setAttribute("href", url);
+        link.setAttribute("download", `my_transactions_${filterMonth}_${filterYear}.csv`);
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    };
 
     const handleLogout = () => {
         logout();
@@ -134,7 +220,13 @@ const EmployeeDashboard = () => {
         setConnectingWallet(true);
         const result = await connectWallet();
         if (!result.success) {
-            alert(result.error);
+            Swal.fire({
+                icon: 'error',
+                title: 'Connection Failed',
+                text: result.error,
+                background: '#1a1a1a',
+                color: '#fff'
+            });
         }
         setConnectingWallet(false);
     };
@@ -149,39 +241,143 @@ const EmployeeDashboard = () => {
 
     const handleWithdraw = async (streamId) => {
         if (!walletAddress) {
-            alert('Please connect your wallet first');
+            Swal.fire({ icon: 'warning', title: 'Wallet Disconnected', text: 'Please connect your wallet first', background: '#1a1a1a', color: '#fff' });
             return;
         }
+
+        setWithdrawingStreamId(streamId);
         try {
-            await withdraw(streamId);
-            alert('Withdrawal successful! Your balance will be updated shortly.');
+            await Swal.fire({
+                title: 'Confirm Withdrawal',
+                text: "Are you sure you want to withdraw your claimable funds from this stream?",
+                icon: 'question',
+                showCancelButton: true,
+                confirmButtonColor: '#10b981',
+                cancelButtonColor: '#ef4444',
+                confirmButtonText: 'Yes, withdraw!',
+                background: '#1a1a1a',
+                color: '#fff'
+            }).then(async (result) => {
+                if (result.isConfirmed) {
+                    Swal.fire({
+                        title: 'Processing...',
+                        text: 'Please confirm the transaction in your wallet',
+                        allowOutsideClick: false,
+                        didOpen: () => Swal.showLoading(),
+                        background: '#1a1a1a',
+                        color: '#fff'
+                    });
+
+                    const tx = await withdraw(streamId);
+
+                    Swal.fire({
+                        icon: 'success',
+                        title: 'Success!',
+                        text: `Withdrawal successful! Hash: ${tx.hash.slice(0, 10)}...`,
+                        background: '#1a1a1a',
+                        color: '#fff',
+                        timer: 3000
+                    });
+
+                    setTimeout(fetchUserStreams, 3000);
+                }
+            });
         } catch (error) {
             console.error('Withdrawal failed:', error);
-            alert('Withdrawal failed: ' + error.message);
+            Swal.fire({
+                icon: 'error',
+                title: 'Withdrawal Failed',
+                text: error.reason || error.message || "Unknown error",
+                background: '#1a1a1a',
+                color: '#fff'
+            });
+        } finally {
+            setWithdrawingStreamId(null);
+        }
+    };
+
+    const handleWithdrawAll = async () => {
+        const streamsWithFunds = streams.filter(s => (liveClaimable[s.streamId] || 0n) > 0n);
+
+        if (streamsWithFunds.length === 0) {
+            Swal.fire({ icon: 'info', title: 'No Funds', text: 'You have no claimable funds in any stream.', background: '#1a1a1a', color: '#fff' });
+            return;
+        }
+
+        const confirm = await Swal.fire({
+            title: `Withdraw from ${streamsWithFunds.length} Streams?`,
+            text: "This will initiate multiple transactions to claim all your available funds.",
+            icon: 'question',
+            showCancelButton: true,
+            confirmButtonText: 'Yes, withdraw all',
+            background: '#1a1a1a',
+            color: '#fff'
+        });
+
+        if (confirm.isConfirmed) {
+            setIsWithdrawingAll(true);
+            try {
+                for (const stream of streamsWithFunds) {
+                    try {
+                        Swal.fire({
+                            title: `Withdrawing Stream #${stream.streamId}`,
+                            text: 'Confirming in wallet...',
+                            allowOutsideClick: false,
+                            didOpen: () => Swal.showLoading(),
+                            background: '#1a1a1a',
+                            color: '#fff'
+                        });
+                        const tx = await withdraw(stream.streamId);
+                        console.log(`Withdrawn stream ${stream.streamId}, hash: ${tx.hash}`);
+                    } catch (err) {
+                        console.error(`Failed to withdraw stream ${stream.streamId}`, err);
+                        // Continue to next or stop? Let's show error and allow moving on
+                        const res = await Swal.fire({
+                            title: 'Withdrawal Failed',
+                            text: `Stream #${stream.streamId} failed: ${err.message}. Continue with others?`,
+                            icon: 'error',
+                            showCancelButton: true,
+                            confirmButtonText: 'Continue',
+                            background: '#1a1a1a',
+                            color: '#fff'
+                        });
+                        if (!res.isConfirmed) break;
+                    }
+                }
+                Swal.fire({ icon: 'success', title: 'Batch Completed', text: 'All requests processed.', background: '#1a1a1a', color: '#fff' });
+                setTimeout(fetchUserStreams, 2000);
+            } finally {
+                setIsWithdrawingAll(false);
+            }
         }
     };
 
     const [exchangeAmount, setExchangeAmount] = useState('');
-    const EXCHANGE_RATE = 0.0005; // 1 USD = 0.0005 ETH (example rate)
+    const EXCHANGE_RATE = 1.0; // 1 USD = 1.0 HLUSD (Stablecoin)
 
     const handleExchange = () => {
         if (!walletAddress) {
-            alert('Please connect your wallet first');
+            Swal.fire({ icon: 'warning', title: 'Wallet Disconnected', text: 'Please connect your wallet first', background: '#1a1a1a', color: '#fff' });
             return;
         }
         if (!exchangeAmount || parseFloat(exchangeAmount) <= 0) {
-            alert('Please enter a valid amount');
+            Swal.fire({ icon: 'info', text: 'Please enter a valid amount', background: '#1a1a1a', color: '#fff' });
             return;
         }
         const amount = parseFloat(exchangeAmount);
         const totalClaimable = Object.values(liveClaimable).reduce((acc, v) => acc + v, 0n);
         if (BigInt(Math.floor(amount * 1e18)) > totalClaimable) {
-            alert('Insufficient balance to exchange');
+            Swal.fire({ icon: 'error', title: 'Insufficient Balance', text: 'You do not have enough claimable balance.', background: '#1a1a1a', color: '#fff' });
             return;
         }
-        const ethAmount = (amount * EXCHANGE_RATE).toFixed(6);
-        console.log('Exchanging:', { amount, ethAmount });
-        alert(`Exchange initiated!\n$${amount} → ${ethAmount} ETH`);
+        const hlusdAmount = (amount * EXCHANGE_RATE).toFixed(2);
+        Swal.fire({
+            title: 'Bank Transfer Initiated!',
+            text: `Sent $${(amount * 2).toLocaleString()} to your bank account!`,
+            icon: 'success',
+            background: '#1a1a1a',
+            color: '#fff'
+        });
         setExchangeAmount('');
     };
 
@@ -274,11 +470,12 @@ const EmployeeDashboard = () => {
                                 variant="success"
                                 size="sm"
                                 fullWidth
-                                onClick={() => streams.length > 0 && handleWithdraw(streams[0].streamId)}
-                                disabled={!walletAddress || streams.length === 0}
+                                onClick={handleWithdrawAll}
+                                loading={isWithdrawingAll}
+                                disabled={!walletAddress}
                                 icon={<Download size={16} />}
                             >
-                                Withdraw Primary
+                                Withdraw All
                             </Button>
                         </div>
                     </div>
@@ -286,10 +483,6 @@ const EmployeeDashboard = () => {
                     <div className="sidebar-section">
                         <h4 className="sidebar-title">Account Info</h4>
                         <div className="account-info">
-                            <div className="info-row">
-                                <span className="info-label">Employee ID</span>
-                                <span className="info-value mono-text">{user?.employeeId || 'N/A'}</span>
-                            </div>
                             <div className="info-row">
                                 <span className="info-label">Wallet</span>
                                 <span className="info-value mono-text text-xs">
@@ -299,7 +492,7 @@ const EmployeeDashboard = () => {
                             <div className="info-row">
                                 <span className="info-label">Current Rate</span>
                                 <span className="info-value">
-                                    {formatWei(streams.filter(s => s.state === 'Active').reduce((acc, s) => acc + BigInt(s.ratePerSecond), 0n) * 3600n)} ETH/hr
+                                    {formatWei(streams.filter(s => s.state === 'Active').reduce((acc, s) => acc + BigInt(s.ratePerSecond), 0n) * 3600n)} HLUSD/hr
                                 </span>
                             </div>
                         </div>
@@ -332,7 +525,7 @@ const EmployeeDashboard = () => {
                                     <div className="balance-info">
                                         <p className="balance-label">Total Withdrawn</p>
                                         <h2 className="balance-amount">
-                                            {showBalance ? `${formatWei(streams.reduce((acc, s) => acc + BigInt(s.withdrawn), 0n))} ETH` : '••••••'}
+                                            {showBalance ? `${formatWei(streams.reduce((acc, s) => acc + BigInt(s.withdrawn), 0n))} HLUSD` : '••••••'}
                                         </h2>
                                         <span className="balance-subtext">Lifetime earnings from all streams</span>
                                     </div>
@@ -347,9 +540,12 @@ const EmployeeDashboard = () => {
                                     <div className="balance-info">
                                         <p className="balance-label">Available to Withdraw</p>
                                         <h2 className="balance-amount">
-                                            {showBalance ? `${formatWei(Object.values(liveClaimable).reduce((acc, v) => acc + v, 0n))} ETH` : '••••••'}
+                                            {showBalance ? `${formatWei(Object.values(liveClaimable).reduce((acc, v) => acc + v, 0n))} HLUSD` : '••••••'}
                                         </h2>
-                                        <span className="balance-subtext">Vested funds ready for withdrawal</span>
+                                        <span className="balance-subtext">
+                                            {streams.some(s => s.state === 'Active') && <span className="pulse-dot"></span>}
+                                            Vested funds ready for withdrawal
+                                        </span>
                                     </div>
                                 </Card>
 
@@ -362,10 +558,10 @@ const EmployeeDashboard = () => {
                                     <div className="balance-info">
                                         <p className="balance-label">Streaming Rate</p>
                                         <h2 className="balance-amount">
-                                            {formatWei(streams.filter(s => s.state === 'Active').reduce((acc, s) => acc + BigInt(s.ratePerSecond), 0n) * 3600n)} ETH/hr
+                                            {formatWei(streams.filter(s => s.state === 'Active').reduce((acc, s) => acc + BigInt(s.ratePerSecond), 0n) * 3600n)} HLUSD/hr
                                         </h2>
                                         <span className="balance-subtext">
-                                            Estimated monthly: {formatWei(streams.filter(s => s.state === 'Active').reduce((acc, s) => acc + BigInt(s.ratePerSecond), 0n) * 3600n * 24n * 30n)} ETH
+                                            Estimated monthly: {formatWei(streams.filter(s => s.state === 'Active').reduce((acc, s) => acc + BigInt(s.ratePerSecond), 0n) * 3600n * 24n * 30n)} HLUSD
                                         </span>
                                     </div>
                                 </Card>
@@ -402,19 +598,50 @@ const EmployeeDashboard = () => {
                                     </ResponsiveContainer>
                                 </CardBody>
                             </Card>
+
+                            {/* Latest 3 Transactions Summary */}
+                            <Card className="latest-transactions-card mt-6">
+                                <CardHeader>
+                                    <div className="flex justify-between items-center w-full">
+                                        <h3>Recent Transactions</h3>
+                                        <Button variant="ghost" size="sm" onClick={() => setActiveTab('transactions')}>View All</Button>
+                                    </div>
+                                </CardHeader>
+                                <CardBody>
+                                    <div className="transactions-list-compact">
+                                        {transactions.slice(0, 3).map((tx) => (
+                                            <div key={tx._id || tx.id} className="tx-item-compact">
+                                                <div className="tx-icon">
+                                                    <Receipt size={18} />
+                                                </div>
+                                                <div className="tx-details">
+                                                    <span className="tx-type">{tx.type}</span>
+                                                    <span className="tx-date">{new Date(tx.timestamp || tx.date).toLocaleDateString()}</span>
+                                                </div>
+                                                <div className="tx-amount success">
+                                                    {tx.amount ? `+${formatWei(BigInt(tx.amount))}` : '0'}
+                                                </div>
+                                            </div>
+                                        ))}
+                                        {transactions.length === 0 && (
+                                            <p className="empty-msg">No transactions found yet.</p>
+                                        )}
+                                    </div>
+                                </CardBody>
+                            </Card>
                         </div>
                     )}
 
                     {activeTab === 'streams' && (
                         <div className="streams-section animate-fade-in">
-                            <h2 className="section-title">Active Payment Streams</h2>
-                            <p className="section-subtitle">Monitor and manage your incoming streams</p>
+                            <h2 className="section-title">All Payment Streams</h2>
+                            <p className="section-subtitle">Monitor and manage all your historical and incoming streams</p>
 
                             <div className="streams-list">
                                 {streams.length === 0 ? (
                                     <div className="empty-state">
                                         <Activity size={48} />
-                                        <p>No active streams found for your wallet.</p>
+                                        <p>No payment streams found for your wallet.</p>
                                     </div>
                                 ) : (
                                     streams.map(stream => (
@@ -429,7 +656,7 @@ const EmployeeDashboard = () => {
                                                 </div>
                                                 <div className="stream-amount">
                                                     <span className="amount-label">Total Deposit</span>
-                                                    <span className="amount-value">{formatWei(BigInt(stream.deposit))} ETH</span>
+                                                    <span className="amount-value">{formatWei(BigInt(stream.deposit))} HLUSD</span>
                                                 </div>
                                             </div>
                                             <div className="stream-details">
@@ -440,12 +667,12 @@ const EmployeeDashboard = () => {
                                                 <div className="detail-item highlighted">
                                                     <span className="detail-label">Claimable Now</span>
                                                     <span className="detail-value mono-text live-counter">
-                                                        {formatWei(liveClaimable[stream.streamId] || 0n)} ETH
+                                                        {formatWei(liveClaimable[stream.streamId] || 0n)} HLUSD
                                                     </span>
                                                 </div>
                                                 <div className="detail-item">
                                                     <span className="detail-label">Withdrawn</span>
-                                                    <span className="detail-value">{formatWei(BigInt(stream.withdrawn))} ETH</span>
+                                                    <span className="detail-value">{formatWei(BigInt(stream.withdrawn))} HLUSD</span>
                                                 </div>
                                             </div>
                                             <div className="stream-actions">
@@ -453,7 +680,8 @@ const EmployeeDashboard = () => {
                                                     variant="success"
                                                     size="sm"
                                                     onClick={() => handleWithdraw(stream.streamId)}
-                                                    disabled={!walletAddress || (liveClaimable[stream.streamId] || 0n) === 0n}
+                                                    loading={withdrawingStreamId === stream.streamId}
+                                                    disabled={!walletAddress}
                                                     icon={<Download size={14} />}
                                                 >
                                                     Withdraw Claimable
@@ -468,8 +696,34 @@ const EmployeeDashboard = () => {
 
                     {activeTab === 'transactions' && (
                         <div className="transactions-section animate-fade-in">
-                            <h2 className="section-title">Transaction History</h2>
-                            <p className="section-subtitle">All your payment transactions</p>
+                            <div className="flex justify-between items-center mb-6">
+                                <div>
+                                    <h2 className="section-title">Transaction History</h2>
+                                    <p className="section-subtitle">All your payment transactions</p>
+                                </div>
+                                <div className="flex gap-2">
+                                    <select className="filter-select" value={filterYear} onChange={(e) => setFilterYear(e.target.value)}>
+                                        <option value="all">All Years</option>
+                                        <option value="2024">2024</option>
+                                        <option value="2025">2025</option>
+                                        <option value="2026">2026</option>
+                                    </select>
+                                    <select className="filter-select" value={filterMonth} onChange={(e) => setFilterMonth(e.target.value)}>
+                                        <option value="all">All Months</option>
+                                        {['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'].map((m, i) => (
+                                            <option key={m} value={(i + 1).toString()}>{m}</option>
+                                        ))}
+                                    </select>
+                                    <select className="filter-select" value={filterType} onChange={(e) => setFilterType(e.target.value)}>
+                                        <option value="all">All Types</option>
+                                        <option value="Withdrawal">Withdrawal</option>
+                                        <option value="StreamCreated">Stream Created</option>
+                                    </select>
+                                    <Button variant="secondary" size="sm" onClick={handleExportTransactions} icon={<FileDown size={16} />}>
+                                        Export CSV
+                                    </Button>
+                                </div>
+                            </div>
 
                             <Card>
                                 <div className="table-container">
@@ -483,16 +737,26 @@ const EmployeeDashboard = () => {
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            {recentTransactions.map(tx => (
-                                                <tr key={tx.id}>
-                                                    <td>{new Date(tx.date).toLocaleDateString()}</td>
-                                                    <td>{tx.type}</td>
-                                                    <td className="amount-cell">${tx.amount.toLocaleString()}</td>
-                                                    <td>
-                                                        <span className="status-badge status-completed">{tx.status}</span>
-                                                    </td>
+                                            {filteredTransactions.length === 0 ? (
+                                                <tr>
+                                                    <td colSpan="4" className="text-center py-8 opacity-50">No transactions found matching filters</td>
                                                 </tr>
-                                            ))}
+                                            ) : (
+                                                filteredTransactions.map(tx => (
+                                                    <tr key={tx._id || tx.id}>
+                                                        <td>{new Date(tx.timestamp || tx.date).toLocaleDateString()}</td>
+                                                        <td>{tx.type}</td>
+                                                        <td className="amount-cell">
+                                                            {tx.amount ? `${formatWei(BigInt(tx.amount))} HLUSD` : '-'}
+                                                        </td>
+                                                        <td>
+                                                            <span className="status-badge status-completed">
+                                                                {tx.status || 'Completed'}
+                                                            </span>
+                                                        </td>
+                                                    </tr>
+                                                ))
+                                            )}
                                         </tbody>
                                     </table>
                                 </div>
@@ -502,64 +766,108 @@ const EmployeeDashboard = () => {
                     {activeTab === 'exchange' && (
                         <div className="exchange-section animate-fade-in">
                             <h2 className="section-title">Token Exchange</h2>
-                            <p className="section-subtitle">Convert your earnings to crypto tokens</p>
+                            <p className="section-subtitle">Seamlessly convert your streaming earnings to fiat currency</p>
 
                             <div className="exchange-container">
                                 <Card className="exchange-card">
-                                    <div className="exchange-header">
-                                        <h3>Exchange USD to ETH</h3>
-                                        <p className="exchange-rate-badge">Current Rate: 1 USD = {EXCHANGE_RATE} ETH</p>
+                                    <div className="exchange-header-v2">
+                                        <div className="exchange-title-group">
+                                            <h3>Convert HLUSD</h3>
+                                            <span className="exchange-status-online">
+                                                <span className="pulse-dot"></span>
+                                                Bank Gateway Live
+                                            </span>
+                                        </div>
+                                        <div className="exchange-rate-v2">
+                                            <span>Exchange Rate</span>
+                                            <strong>1 HLUSD = $2.00 USD</strong>
+                                        </div>
                                     </div>
 
-                                    <div className="exchange-form">
-                                        <div className="input-group">
-                                            <label className="input-label">Amount (USD)</label>
-                                            <div className="input-wrapper-currency">
-                                                <span className="currency-symbol">$</span>
+                                    <div className="swap-interface">
+                                        <div className="swap-box">
+                                            <div className="swap-box-header">
+                                                <span className="swap-label">You Sell</span>
+                                                <button
+                                                    className="max-btn"
+                                                    onClick={() => {
+                                                        const total = formatWei(Object.values(liveClaimable).reduce((acc, v) => acc + v, 0n));
+                                                        setExchangeAmount(total);
+                                                    }}
+                                                >
+                                                    MAX
+                                                </button>
+                                            </div>
+                                            <div className="swap-input-row">
                                                 <input
                                                     type="number"
                                                     value={exchangeAmount}
                                                     onChange={(e) => setExchangeAmount(e.target.value)}
                                                     placeholder="0.00"
-                                                    className="exchange-input"
+                                                    className="swap-input"
                                                 />
+                                                <div className="token-selector">
+                                                    <div className="token-icon-mini hl-logo">H</div>
+                                                    <span className="token-name">HLUSD</span>
+                                                </div>
                                             </div>
-                                            <div className="balance-hint">
-                                                Available: {formatWei(Object.values(liveClaimable).reduce((acc, v) => acc + v, 0n))} ETH
+                                            <div className="swap-balance">
+                                                Balance: {formatWei(Object.values(liveClaimable).reduce((acc, v) => acc + v, 0n))} HLUSD
                                             </div>
                                         </div>
 
-                                        <div className="exchange-divider">
-                                            <div className="divider-line"></div>
-                                            <div className="divider-icon">
+                                        <div className="swap-arrow-container">
+                                            <div className="swap-arrow-pill">
                                                 <ArrowDownToLine size={20} />
                                             </div>
-                                            <div className="divider-line"></div>
                                         </div>
 
-                                        <div className="input-group">
-                                            <label className="input-label">You Receive (Estimated)</label>
-                                            <div className="input-wrapper-currency">
-                                                <span className="currency-symbol">ETH</span>
+                                        <div className="swap-box second">
+                                            <div className="swap-box-header">
+                                                <span className="swap-label">You Receive (Estimate)</span>
+                                            </div>
+                                            <div className="swap-input-row">
                                                 <input
                                                     type="text"
-                                                    value={exchangeAmount ? (parseFloat(exchangeAmount) * EXCHANGE_RATE).toFixed(6) : '0.000000'}
+                                                    value={exchangeAmount ? (parseFloat(exchangeAmount) * 2).toFixed(2) : '0.00'}
                                                     readOnly
-                                                    className="exchange-input read-only"
+                                                    className="swap-input"
                                                 />
+                                                <div className="token-selector">
+                                                    <div className="token-icon-mini usd-logo">$</div>
+                                                    <span className="token-name">USD</span>
+                                                </div>
+                                            </div>
+                                            <div className="swap-balance">
+                                                Target: Linked Bank Account
+                                            </div>
+                                        </div>
+
+                                        <div className="exchange-details-v2">
+                                            <div className="detail-row-v2">
+                                                <span>Exchange Fee (0%)</span>
+                                                <span className="fee-free">Free</span>
+                                            </div>
+                                            <div className="detail-row-v2">
+                                                <span>Estimated Arrival</span>
+                                                <span>Instant / ~1-2 mins</span>
+                                            </div>
+                                            <div className="detail-row-v2 total">
+                                                <span>Total to Bank</span>
+                                                <strong>${exchangeAmount ? (parseFloat(exchangeAmount) * 2).toFixed(2) : '0.00'} USD</strong>
                                             </div>
                                         </div>
 
                                         <Button
-                                            variant="primary"
+                                            variant="success"
                                             size="lg"
                                             fullWidth
                                             onClick={handleExchange}
-                                            disabled={!walletAddress || !exchangeAmount}
+                                            disabled={!walletAddress || !exchangeAmount || parseFloat(exchangeAmount) <= 0}
                                             icon={<ArrowLeftRight size={20} />}
-                                            className="exchange-btn"
+                                            className="swap-submit-btn"
                                         >
-                                            Exchange Tokens
+                                            Withdraw to Bank
                                         </Button>
                                     </div>
                                 </Card>

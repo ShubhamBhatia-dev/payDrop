@@ -2,7 +2,44 @@ import { ethers } from 'ethers';
 import PayStreamABI from '../abi/PayStream.json';
 
 // REPLACE WITH YOUR DEPLOYED CONTRACT ADDRESS
-export const CONTRACT_ADDRESS = '0x8B4B5f425A1922b915761e9Fc14B1C1D8cedFda6';
+// Hela Testnet Chain ID
+const HELA_CHAIN_ID = '0xa2d08'; // 666888 in hex
+
+export const CONTRACT_ADDRESS = '0xa9aE42d8D3583de0677e41Cee8FBeb16Bde5D870';
+
+const switchNetwork = async () => {
+    try {
+        await window.ethereum.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: HELA_CHAIN_ID }],
+        });
+    } catch (switchError) {
+        // This error code indicates that the chain has not been added to MetaMask.
+        if (switchError.code === 4902) {
+            try {
+                await window.ethereum.request({
+                    method: 'wallet_addEthereumChain',
+                    params: [
+                        {
+                            chainId: HELA_CHAIN_ID,
+                            chainName: 'Hela Testnet',
+                            rpcUrls: ['https://testnet-rpc.helachain.com'],
+                            nativeCurrency: {
+                                name: 'HLUSD',
+                                symbol: 'HLUSD', // or whatever the symbol is
+                                decimals: 18,
+                            },
+                        },
+                    ],
+                });
+            } catch (addError) {
+                console.error("Failed to add Hela network:", addError);
+            }
+        } else {
+            console.error("Failed to switch network:", switchError);
+        }
+    }
+};
 
 export const connectWallet = async () => {
     if (!window.ethereum) {
@@ -10,6 +47,7 @@ export const connectWallet = async () => {
     }
 
     try {
+        await switchNetwork();
         const provider = new ethers.BrowserProvider(window.ethereum);
         const accounts = await provider.send("eth_requestAccounts", []);
         const signer = await provider.getSigner();
@@ -34,6 +72,9 @@ export const getContract = async (signerOrProvider) => {
 
 export const createStream = async (workerAddress, amountInEth, streamType, durationOrEndTime) => {
     try {
+        // Validate and checksum the address to prevent ENS resolution errors on non-Ethereum networks
+        const validatedAddress = ethers.getAddress(workerAddress.trim());
+
         const { signer } = await connectWallet();
         const contract = await getContract(signer);
 
@@ -47,11 +88,15 @@ export const createStream = async (workerAddress, amountInEth, streamType, durat
         // Ensure accurate BigInt handling
         const duration = BigInt(durationOrEndTime);
 
-        const tx = await contract.createStream(type, workerAddress, amountWei, duration);
-        await tx.wait(); // Wait for confirmation
-        return tx;
+        const tx = await contract.createStream(type, validatedAddress, amountWei, duration, { gasLimit: 3000000 });
+        const receipt = await tx.wait(); // Wait for confirmation and get receipt
+        return receipt;
     } catch (error) {
         console.error("Create Stream Error:", error);
+        // Provide a friendlier message for invalid addresses
+        if (error.code === 'INVALID_ARGUMENT' || error.message.includes('getAddress')) {
+            throw new Error("Invalid wallet address format. Please check and try again.");
+        }
         throw error;
     }
 };
@@ -63,7 +108,7 @@ export const fundSystem = async (amountInEth) => {
 
         const amountWei = ethers.parseEther(amountInEth.toString());
 
-        const tx = await contract.fundSystem({ value: amountWei });
+        const tx = await contract.fundSystem({ value: amountWei, gasLimit: 500000 });
         await tx.wait();
         return tx;
     } catch (error) {
@@ -77,7 +122,7 @@ export const withdraw = async (streamId) => {
         const { signer } = await connectWallet();
         const contract = await getContract(signer);
 
-        const tx = await contract.withdraw(streamId);
+        const tx = await contract.withdraw(streamId, { gasLimit: 500000 });
         await tx.wait();
         return tx;
     } catch (error) {
@@ -102,7 +147,7 @@ export const setStreamState = async (streamId, newState) => {
             default: throw new Error("Invalid state");
         }
 
-        const tx = await contract.setState(streamId, stateEnum);
+        const tx = await contract.setState(streamId, stateEnum, { gasLimit: 1000000 });
         await tx.wait();
         return tx;
     } catch (error) {
@@ -116,7 +161,7 @@ export const emergencyWithdraw = async () => {
         const { signer } = await connectWallet();
         const contract = await getContract(signer);
 
-        const tx = await contract.emergency();
+        const tx = await contract.emergency({ gasLimit: 500000 });
         await tx.wait();
         return tx;
     } catch (error) {
@@ -129,4 +174,17 @@ export const emergencyWithdraw = async () => {
 // Frontend primarily relies on API for list, but can listen for toaster notifications
 export const listenToContractEvents = (callback) => {
     // Basic setup, user can extend
+};
+
+export const getAvailableBalance = async () => {
+    try {
+        const validatedContractAddress = ethers.getAddress(CONTRACT_ADDRESS);
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        const contract = new ethers.Contract(validatedContractAddress, PayStreamABI, provider);
+        const balance = await contract.availableBalance();
+        return ethers.formatEther(balance);
+    } catch (error) {
+        console.error("Get Balance Error:", error);
+        return "0";
+    }
 };

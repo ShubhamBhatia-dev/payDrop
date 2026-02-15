@@ -1,6 +1,8 @@
 const { ethers } = require('ethers');
 const Stream = require('../models/Stream');
 const User = require('../models/User');
+const Transaction = require('../models/Transaction');
+const ContractStats = require('../models/ContractStats');
 const path = require('path');
 const fs = require('fs');
 
@@ -17,18 +19,8 @@ let provider;
 let contract;
 
 function setupProvider() {
-    console.log('Connecting to Blockchain...');
-    provider = new ethers.WebSocketProvider(RPC_URL);
-
-    provider.websocket.on('error', (err) => {
-        console.error('WebSocket Error:', err);
-        reconnect();
-    });
-
-    provider.websocket.on('close', (code) => {
-        console.warn('WebSocket Closed (code:', code, '). Reconnecting...');
-        reconnect();
-    });
+    console.log('Connecting to Blockchain (Hela Testnet)...');
+    provider = new ethers.JsonRpcProvider(RPC_URL);
 
     contract = new ethers.Contract(CONTRACT_ADDRESS, contractABI, provider);
 
@@ -37,6 +29,28 @@ function setupProvider() {
     contract.on('Withdrawn', handleWithdrawn);
     contract.on('StreamStateChanged', handleStreamStateChanged);
     contract.on('Funded', handleFunded);
+    contract.on('EmergencyWithdraw', handleEmergencyWithdrawEvent);
+
+    syncStats();
+}
+
+async function syncStats() {
+    try {
+        const balance = await contract.availableBalance();
+        const allocated = await contract.totalAllocated();
+
+        await ContractStats.findOneAndUpdate(
+            { contractAddress: CONTRACT_ADDRESS.toLowerCase() },
+            {
+                availableBalance: balance.toString(),
+                totalAllocated: allocated.toString()
+            },
+            { upsert: true, new: true }
+        );
+        console.log('Contract Stats synced with blockchain');
+    } catch (err) {
+        console.error('Error syncing stats:', err);
+    }
 }
 
 let reconnectTimeout;
@@ -77,15 +91,18 @@ async function handleStreamCreated(id, worker, amount, event) {
     const exists = await Stream.findOne({ streamId });
     if (exists) return;
 
-    console.log(`New Stream Created: ID ${streamId}`);
+    console.log(`Processing Stream ID ${streamId}...`);
 
     try {
+        console.log('Fetching stream info...');
         const info = await contract.getStreamInfo(id);
+        console.log('Fetching full stream data...');
         const fullStream = await contract.streams(id);
+        console.log('Fetching worker metadata...');
         const metadata = await getWorkerMetadata(worker);
+        console.log('Metadata found:', metadata.name);
 
-        const newStream = new Stream({
-            streamId: streamId,
+        const streamData = {
             workerAddress: worker.toLowerCase(),
             deposit: info.deposit.toString(),
             withdrawn: info.withdrawn.toString(),
@@ -99,30 +116,84 @@ async function handleStreamCreated(id, worker, amount, event) {
             blockNumber: Number(event.blockNumber || event.log?.blockNumber || 0),
             workerName: metadata.name,
             workerEmail: metadata.email
-        });
+        };
 
-        await newStream.save();
-        console.log(`Stream ${streamId} saved to DB`);
+        const savedStream = await Stream.findOneAndUpdate(
+            { streamId },
+            {
+                $set: streamData,
+                $setOnInsert: { label: 'employee' }
+            },
+            { upsert: true, new: true }
+        );
+
+        // Save Transaction
+        const txData = {
+            type: 'StreamCreated',
+            streamId: streamId,
+            sender: CONTRACT_ADDRESS,
+            receiver: worker,
+            amount: info.deposit.toString(),
+            status: 'Confirmed',
+            timestamp: new Date()
+        };
+
+        await Transaction.findOneAndUpdate(
+            { txHash: event.transactionHash || event.log?.transactionHash || `stream-${streamId}` },
+            {
+                $set: txData,
+                $setOnInsert: { label: savedStream.label || 'employee' }
+            },
+            { upsert: true, new: true }
+        );
+
+        console.log(`Stream ${streamId} saved/updated in DB (Label: ${savedStream.label})`);
+        syncStats();
     } catch (err) {
         console.error(`Error handling StreamCreated for ${streamId}:`, err);
     }
 }
 
-async function handleWithdrawn(id, worker, amount, event) {
-    const streamId = Number(id);
-    console.log(`Withdrawal from Stream ${streamId}: ${ethers.formatEther(amount)} ETH`);
+async function handleWithdrawn(streamIdRaw, amount, event) {
+    const streamId = Number(streamIdRaw);
+    console.log(`Stream ${streamId} withdrawn: ${ethers.formatEther(amount)} ETH`);
 
     try {
-        const info = await contract.getStreamInfo(id);
+        const info = await contract.getStreamInfo(streamId);
 
-        await Stream.updateOne(
+        // Find existing stream to get label
+        const existingStream = await Stream.findOne({ streamId });
+        const label = existingStream ? existingStream.label : 'employee';
+
+        await Stream.findOneAndUpdate(
             { streamId: streamId },
             {
                 withdrawn: info.withdrawn.toString(),
                 state: StreamStateMap[Number(info.state)]
             }
         );
-        console.log(`Stream ${streamId} updated (Withdrawal)`);
+
+        // Save Transaction
+        const txData = {
+            type: 'Withdrawal',
+            streamId: streamId,
+            sender: CONTRACT_ADDRESS,
+            receiver: existingStream ? existingStream.workerAddress : 'unknown',
+            amount: amount.toString(),
+            status: 'Confirmed',
+            timestamp: new Date()
+        };
+
+        await Transaction.findOneAndUpdate(
+            { txHash: event.transactionHash || event.log?.transactionHash },
+            {
+                $set: txData,
+                $setOnInsert: { label: label }
+            },
+            { upsert: true, new: true }
+        );
+
+        syncStats();
     } catch (err) {
         console.error(`Error handling Withdrawn for ${streamId}:`, err);
     }
@@ -145,6 +216,16 @@ async function handleStreamStateChanged(id, newState, event) {
                 totalPausedDuration: Number(fullStream.totalPausedDuration)
             }
         );
+
+        // Save Transaction
+        await new Transaction({
+            type: 'StateChange',
+            streamId: streamId,
+            txHash: event.transactionHash || event.log?.transactionHash || `state-${Date.now()}`,
+            timestamp: new Date()
+        }).save().catch(e => console.log('Duplicate Tx ignored'));
+
+        syncStats();
     } catch (err) {
         console.error(`Error handling StateChange for ${streamId}:`, err);
     }
@@ -152,22 +233,81 @@ async function handleStreamStateChanged(id, newState, event) {
 
 async function handleFunded(sender, amount, event) {
     console.log(`Contract Funded: ${ethers.formatEther(amount)} ETH from ${sender}`);
+    try {
+        await new Transaction({
+            type: 'Funding',
+            sender: sender,
+            amount: amount.toString(),
+            txHash: event.transactionHash || event.log?.transactionHash || `fund-${Date.now()}`,
+            timestamp: new Date()
+        }).save().catch(e => console.log('Duplicate Tx ignored'));
+
+        syncStats();
+    } catch (err) {
+        console.error('Error handling Funded event:', err);
+    }
 }
 
+async function handleEmergencyWithdrawEvent(owner, amount, event) {
+    console.log(`Emergency Withdrawal: ${ethers.formatEther(amount)} ETH by ${owner}`);
+    try {
+        await new Transaction({
+            type: 'Emergency',
+            receiver: owner,
+            amount: amount.toString(),
+            txHash: event.transactionHash || event.log?.transactionHash || `emergency-${Date.now()}`,
+            timestamp: new Date()
+        }).save().catch(e => console.log('Duplicate Tx ignored'));
+
+        syncStats();
+    } catch (err) {
+        console.error('Error handling Emergency event:', err);
+    }
+}
+
+let isSyncing = false;
 // Sync past events to find missing streams
 async function syncPastEvents() {
-    console.log('Syncing past events...');
+    if (isSyncing) return;
+    isSyncing = true;
+    console.log('Syncing past events in chunks...');
     try {
-        // Look back last 5000 blocks (adjust as needed)
-        const filter = contract.filters.StreamCreated();
-        const events = await contract.queryFilter(filter, -5000);
+        const currentBlock = await provider.getBlockNumber();
+        const lookback = 100000; // Total blocks to look back (approx 3 days on Hela)
+        const chunkSize = 100; // Hela RPC limit
+        const startBlock = Math.max(0, currentBlock - lookback);
 
-        console.log(`Found ${events.length} StreamCreated events in recent history`);
-        for (const event of events) {
+        let allEvents = [];
+        const filter = contract.filters.StreamCreated();
+
+        const totalChunks = Math.ceil((currentBlock - startBlock) / chunkSize);
+        let chunksDone = 0;
+
+        for (let i = startBlock; i < currentBlock; i += chunkSize) {
+            const end = Math.min(i + chunkSize, currentBlock);
+            try {
+                const events = await contract.queryFilter(filter, i, end);
+                allEvents = allEvents.concat(events);
+                chunksDone++;
+                if (chunksDone % 50 === 0) {
+                    console.log(`Sync Progress: ${((chunksDone / totalChunks) * 100).toFixed(1)}%`);
+                }
+                // Be nice to the RPC
+                await new Promise(r => setTimeout(r, 50));
+            } catch (chunkErr) {
+                console.error(`Error syncing chunk ${i} to ${end}:`, chunkErr.message);
+            }
+        }
+
+        console.log(`Found ${allEvents.length} StreamCreated events in history`);
+        for (const event of allEvents) {
+            console.log('Event Args:', event.args);
             await handleStreamCreated(event.args[0], event.args[1], event.args[2], event);
         }
     } catch (err) {
-        console.error('Error syncing past events:', err);
+        console.error('Error in syncPastEvents:', err);
+    } finally {
+        isSyncing = false;
     }
 }
 
@@ -221,12 +361,12 @@ async function verifyStreams() {
     }
 }
 
-function startEventListener() {
+async function startEventListener() {
     setupProvider();
 
     // Initial Sync
-    syncPastEvents();
-    verifyStreams();
+    await syncPastEvents();
+    await verifyStreams();
 
     // Periodic Sync (10 minutes)
     setInterval(verifyStreams, 10 * 60 * 1000);

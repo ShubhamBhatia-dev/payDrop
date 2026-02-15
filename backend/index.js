@@ -19,6 +19,7 @@ app.use(express.json());
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/employees', require('./routes/employeeRoutes'));
 app.use('/api/streams', require('./routes/streamRoutes'));
+app.use('/api/tax', require('./routes/taxRoutes'));
 
 app.get('/', (req, res) => {
     res.send('API is running...');
@@ -32,5 +33,10 @@ const { startEventListener } = require('./logic/eventListener');
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     // Start listening to blockchain events after server starts
-    startEventListener();
+    startEventListener().catch(err => {
+        console.error('CRITICAL: Event Listener failed to start:', err);
+    });
 });
+
+process.on('unhandledRejection', (reason, promise) => { console.error('Unhandled Rejection at:', promise, 'reason:', reason); });
+process.on('uncaughtException', (err) => { console.error('Uncaught Exception:', err); });

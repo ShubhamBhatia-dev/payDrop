@@ -49,6 +49,12 @@ const StreamSchema = new mongoose.Schema({
     blockNumber: {
         type: Number
     },
+    // Stream label (employee, tax, etc.)
+    label: {
+        type: String,
+        enum: ['employee', 'tax'],
+        default: 'employee'
+    },
     // Optional metadata joined from User
     workerName: {
         type: String

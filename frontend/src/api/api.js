@@ -83,6 +83,42 @@ export const streamAPI = {
     getStream: async (id) => {
         const response = await api.get(`/streams/${id}`);
         return response.data;
+    },
+    getTransactions: async () => {
+        const response = await api.get('/streams/history/transactions');
+        return response.data;
+    },
+    getUserTransactions: async (address) => {
+        const response = await api.get(`/streams/history/transactions/${address}`);
+        return response.data;
+    },
+    getContractStats: async () => {
+        const response = await api.get('/streams/contract-stats/info');
+        return response.data;
+    },
+    labelStream: async (streamId, label) => {
+        const response = await api.post('/streams/label', { streamId, label });
+        return response.data;
+    },
+    labelTransaction: async (txHash, label) => {
+        const response = await api.post('/streams/transaction/label', { txHash, label });
+        return response.data;
+    }
+};
+
+// Tax API
+export const taxAPI = {
+    getTaxSettings: async () => {
+        const response = await api.get('/tax');
+        return response.data;
+    },
+    updateTaxAddress: async (taxAddress) => {
+        const response = await api.post('/tax', { taxAddress });
+        return response.data;
+    },
+    getTaxVault: async () => {
+        const response = await api.get('/tax/vault');
+        return response.data;
     }
 };
 

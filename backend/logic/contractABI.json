@@ -1,5 +1,46 @@
 [
     {
+        "inputs": [
+            {
+                "internalType": "enum PayStream.StreamType",
+                "name": "sType",
+                "type": "uint8"
+            },
+            {
+                "internalType": "address",
+                "name": "workerAddr",
+                "type": "address"
+            },
+            {
+                "internalType": "uint256",
+                "name": "amount",
+                "type": "uint256"
+            },
+            {
+                "internalType": "uint256",
+                "name": "durationOrEndTime",
+                "type": "uint256"
+            }
+        ],
+        "name": "createStream",
+        "outputs": [
+            {
+                "internalType": "uint256",
+                "name": "",
+                "type": "uint256"
+            }
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "emergency",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
         "inputs": [],
         "stateMutability": "nonpayable",
         "type": "constructor"
@@ -41,6 +82,31 @@
         ],
         "name": "Funded",
         "type": "event"
+    },
+    {
+        "inputs": [],
+        "name": "fundSystem",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "streamId",
+                "type": "uint256"
+            },
+            {
+                "internalType": "enum PayStream.StreamState",
+                "name": "newState",
+                "type": "uint8"
+            }
+        ],
+        "name": "setState",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
     },
     {
         "anonymous": false,
@@ -87,6 +153,32 @@
         "type": "event"
     },
     {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "newOwner",
+                "type": "address"
+            }
+        ],
+        "name": "transferOwnership",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "streamId",
+                "type": "uint256"
+            }
+        ],
+        "name": "withdraw",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
         "anonymous": false,
         "inputs": [
             {
@@ -110,6 +202,10 @@
         ],
         "name": "Withdrawn",
         "type": "event"
+    },
+    {
+        "stateMutability": "payable",
+        "type": "receive"
     },
     {
         "inputs": [],
@@ -184,54 +280,6 @@
             }
         ],
         "stateMutability": "view",
-        "type": "function"
-    },
-    {
-        "inputs": [
-            {
-                "internalType": "enum PayStream.StreamType",
-                "name": "sType",
-                "type": "uint8"
-            },
-            {
-                "internalType": "address",
-                "name": "workerAddr",
-                "type": "address"
-            },
-            {
-                "internalType": "uint256",
-                "name": "amount",
-                "type": "uint256"
-            },
-            {
-                "internalType": "uint256",
-                "name": "durationOrEndTime",
-                "type": "uint256"
-            }
-        ],
-        "name": "createStream",
-        "outputs": [
-            {
-                "internalType": "uint256",
-                "name": "",
-                "type": "uint256"
-            }
-        ],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    },
-    {
-        "inputs": [],
-        "name": "emergency",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    },
-    {
-        "inputs": [],
-        "name": "fundSystem",
-        "outputs": [],
-        "stateMutability": "payable",
         "type": "function"
     },
     {
@@ -348,24 +396,6 @@
         "inputs": [
             {
                 "internalType": "uint256",
-                "name": "streamId",
-                "type": "uint256"
-            },
-            {
-                "internalType": "enum PayStream.StreamState",
-                "name": "newState",
-                "type": "uint8"
-            }
-        ],
-        "name": "setState",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    },
-    {
-        "inputs": [
-            {
-                "internalType": "uint256",
                 "name": "",
                 "type": "uint256"
             }
@@ -438,35 +468,5 @@
         ],
         "stateMutability": "view",
         "type": "function"
-    },
-    {
-        "inputs": [
-            {
-                "internalType": "address",
-                "name": "newOwner",
-                "type": "address"
-            }
-        ],
-        "name": "transferOwnership",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    },
-    {
-        "inputs": [
-            {
-                "internalType": "uint256",
-                "name": "streamId",
-                "type": "uint256"
-            }
-        ],
-        "name": "withdraw",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    },
-    {
-        "stateMutability": "payable",
-        "type": "receive"
     }
 ]
